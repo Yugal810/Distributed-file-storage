@@ -4,22 +4,31 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from jose import jwt, JWTError
 import os
+import boto3
+from datetime import datetime 
+from dotenv import load_dotenv
 
 from ..database import get_db
 from .. import models, auth
 
+load_dotenv()
+
 router = APIRouter(tags=["Files"])
 
-# Configuration
-NODES = ["storage_nodes/node1", "storage_nodes/node2", "storage_nodes/node3"]
+# --- AWS Configuration ---
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+)
+BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME")
+
+# We treat S3 "folders" as our nodes
+NODES = ["node1", "node2", "node3"]
 CHUNK_SIZE = 1024 * 1024  # 1MB
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-# Ensure storage directories exist
-for node in NODES:
-    os.makedirs(node, exist_ok=True)
-
-# --- Dependency: Get Current User from JWT ---
+# --- Dependency: Get Current User ---
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     try:
         payload = jwt.decode(token, auth.SECRET_KEY, algorithms=[auth.ALGORITHM])
@@ -34,12 +43,12 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         raise HTTPException(status_code=401, detail="User not found")
     return user
 
-# --- Helper: Cleanup Temp Files ---
+# Helper to clean up the reassembled temp file after download
 def remove_file(path: str):
     if os.path.exists(path):
         os.remove(path)
 
-# --- Route: Upload File (Sharded) ---
+# --- Route: Upload File (To S3) ---
 @router.post("/upload")
 async def upload_file(
     file: UploadFile = File(...), 
@@ -47,51 +56,49 @@ async def upload_file(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    # 1. Read file data
     file_data = await file.read()
 
-    # 2. Create file entry in DB linked to user and folder
+    # 1. Database Entry
     db_file = models.File(
         filename=file.filename,
         owner_id=current_user.id,
-        folder_id=folder_id
+        folder_id=folder_id,
+        size=len(file_data),             
+        created_at=datetime.utcnow()
     )
     db.add(db_file)
     db.commit()
     db.refresh(db_file)
 
-    # 3. Split into chunks
+    # 2. Sharding
     chunks = [file_data[i:i+CHUNK_SIZE] for i in range(0, len(file_data), CHUNK_SIZE)]
-    chunk_locations = []
 
-    # 4. Distribute chunks across nodes
+    # 3. Distribute to S3 Nodes
     for i, chunk in enumerate(chunks):
         node = NODES[i % len(NODES)]
-        chunk_name = f"file_{db_file.id}_chunk_{i}" # Unique naming
-        path = os.path.join(node, chunk_name)
+        chunk_name = f"file_{db_file.id}_chunk_{i}"
+        s3_key = f"{node}/{chunk_name}" # Path inside S3 bucket
 
-        with open(path, "wb") as f:
-            f.write(chunk)
+        # Upload chunk to S3
+        s3_client.put_object(Bucket=BUCKET_NAME, Key=s3_key, Body=chunk)
 
-        # 5. Save chunk metadata
+        # 4. Save metadata
         db_chunk = models.FileChunk(
             file_id=db_file.id,
             chunk_index=i,
-            node=node
+            node=node # Storing 'node1', 'node2', etc.
         )
         db.add(db_chunk)
-        chunk_locations.append(path)
 
     db.commit()
 
     return {
-        "message": "File uploaded successfully",
+        "message": "File uploaded to S3 successfully",
         "file_id": db_file.id,
-        "filename": file.filename,
         "total_chunks": len(chunks)
     }
 
-# --- Route: Download File (Reassemble) ---
+# --- Route: Download (Reassemble from S3) ---
 @router.get("/download/{file_id}")
 def download_file(
     file_id: int, 
@@ -99,93 +106,47 @@ def download_file(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    # 1. Verify file exists and belongs to user
     db_file = db.query(models.File).filter(
         models.File.id == file_id, 
         models.File.owner_id == current_user.id
     ).first()
 
     if not db_file:
-        raise HTTPException(status_code=404, detail="File not found or access denied")
+        raise HTTPException(status_code=404, detail="File not found")
 
-    # 2. Fetch all chunks in order
-    chunks = (
-        db.query(models.FileChunk)
-        .filter(models.FileChunk.file_id == file_id)
-        .order_by(models.FileChunk.chunk_index)
-        .all()
-    )
+    chunks = db.query(models.FileChunk).filter(models.FileChunk.file_id == file_id).order_by(models.FileChunk.chunk_index).all()
 
-    if not chunks:
-        raise HTTPException(status_code=404, detail="File data missing")
-
-    # 3. Reassemble chunks into a temporary file
     output_path = f"temp_{db_file.id}_{db_file.filename}"
     
     with open(output_path, "wb") as output_file:
         for chunk in chunks:
-            chunk_path = os.path.join(chunk.node, f"file_{db_file.id}_chunk_{chunk.chunk_index}")
+            s3_key = f"{chunk.node}/file_{db_file.id}_chunk_{chunk.chunk_index}"
             
-            if not os.path.exists(chunk_path):
-                raise HTTPException(status_code=500, detail=f"Missing chunk {chunk.chunk_index}")
-                
-            with open(chunk_path, "rb") as f:
-                output_file.write(f.read())
+            # Fetch chunk from S3
+            response = s3_client.get_object(Bucket=BUCKET_NAME, Key=s3_key)
+            output_file.write(response['Body'].read())
 
-    # 4. Send file and cleanup temp file afterwards
     background_tasks.add_task(remove_file, output_path)
     
-    return FileResponse(
-        path=output_path, 
-        filename=db_file.filename,
-        media_type='application/octet-stream'
-    )
+    return FileResponse(path=output_path, filename=db_file.filename)
 
+# --- Route: Delete (From S3) ---
 @router.delete("/delete/{file_id}")
 def delete_file(
     file_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    # 1. Find the file and verify ownership
-    db_file = db.query(models.File).filter(
-        models.File.id == file_id, 
-        models.File.owner_id == current_user.id
-    ).first()
-
+    db_file = db.query(models.File).filter(models.File.id == file_id, models.File.owner_id == current_user.id).first()
     if not db_file:
         raise HTTPException(status_code=404, detail="File not found")
 
-    # 2. Find and delete physical chunks from the hard drive
     chunks = db.query(models.FileChunk).filter(models.FileChunk.file_id == file_id).all()
     for chunk in chunks:
-        chunk_path = os.path.join(chunk.node, f"file_{file_id}_chunk_{chunk.chunk_index}")
-        if os.path.exists(chunk_path):
-            os.remove(chunk_path)
+        s3_key = f"{chunk.node}/file_{file_id}_chunk_{chunk.chunk_index}"
+        s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
 
-    # 3. Delete from database (Cascade will handle FileChunks if set up in models)
     db.delete(db_file)
     db.commit()
 
-    return {"detail": f"File {file_id} and its shards successfully deleted"}
-
-@router.patch("/{file_id}/move")
-def move_file(file_id: int, folder_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    file = db.query(models.File).filter(models.File.id == file_id, models.File.owner_id == current_user.id).first()
-    if not file:
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    # Update the folder location
-    file.folder_id = folder_id
-    db.commit()
-    return {"message": f"Moved {file.filename} to folder {folder_id}"}
-
-@router.delete("/folders/{folder_id}")
-def delete_folder(folder_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    folder = db.query(models.Folder).filter(models.Folder.id == folder_id, models.Folder.owner_id == current_user.id).first()
-    if not folder:
-        raise HTTPException(status_code=404, detail="Folder not found")
-    
-    db.delete(folder) # If your models have cascade="all, delete", this wipes subfolders/files too
-    db.commit()
-    return {"message": "Folder deleted"}
+    return {"detail": "File and S3 shards deleted"}

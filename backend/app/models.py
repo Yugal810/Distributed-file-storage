@@ -30,10 +30,12 @@ class File(Base):
     filename = Column(String)
     owner_id = Column(Integer, ForeignKey("users.id"))
     folder_id = Column(Integer, ForeignKey("folders.id"), nullable=True)
+    # Recommended additions:
+    size = Column(Integer, nullable=True) 
+    created_at = Column(DateTime, default=datetime.utcnow)
 
     owner = relationship("User", back_populates="files")
     folder = relationship("Folder", back_populates="files")
-    # Link to the chunks
     chunks = relationship("FileChunk", back_populates="file", cascade="all, delete-orphan")
 
 class FileChunk(Base):
