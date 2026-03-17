@@ -1,0 +1,10 @@
+**/venv/
+**/__pycache__/
+.env
+*.pyc
+
+# Ignore everything in storage_nodes
+storage_nodes/*
+
+# EXCEPT the .gitkeep files (this is the magic part)
+!storage_nodes/**/.gitkeep
