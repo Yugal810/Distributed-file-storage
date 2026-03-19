@@ -30,15 +30,11 @@ def create_access_token(data: dict):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-# --- The Profile Endpoint ---
-@router.get("/me")
-def get_current_user_info(
-    token: str = Depends(oauth2_scheme), 
-    db: Session = Depends(get_db)
-):
+# --- The Profile / Token Validation Dependency ---
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     """
-    Decodes the token and returns the current user's name and email 
-    for the React Dashboard profile section.
+    Decodes the token and returns the current user object.
+    This is used by other routes (folders, files) to verify identity.
     """
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -51,8 +47,15 @@ def get_current_user_info(
     user = db.query(models.User).filter(models.User.email == email).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
-        
+    return user
+
+# --- The Profile Endpoint (for React) ---
+@router.get("/me")
+def get_me(current_user: models.User = Depends(get_current_user)):
+    """
+    Returns the current user's name and email for the React Dashboard profile section.
+    """
     return {
-        "name": user.email.split('@')[0].capitalize(), # Simple fallback for name
-        "email": user.email
+        "name": getattr(current_user, "name", current_user.email.split('@')[0].capitalize()),
+        "email": current_user.email
     }
