@@ -1,6 +1,6 @@
 from datetime import datetime
 from sqlalchemy import Column, Integer, String, ForeignKey, DateTime
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, backref
 from .database import Base
 import uuid
 
@@ -18,20 +18,18 @@ class Folder(Base):
     __tablename__ = "folders"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
-    # ondelete="CASCADE" ensures the DB level link is broken
     parent_id = Column(Integer, ForeignKey("folders.id", ondelete="CASCADE"), nullable=True) 
     owner_id = Column(Integer, ForeignKey("users.id"))
 
     owner = relationship("User", back_populates="folders")
-    # This cascade ensures files inside the folder are deleted when the folder is deleted
     files = relationship("File", back_populates="folder", cascade="all, delete-orphan")
     
-    # Self-referential relationship for subfolders
+    # This is the line that was causing the 500 error
     subfolders = relationship(
         "Folder", 
-        backref="parent", 
-        remote_side=[id], 
-        cascade="all, delete-orphan"
+        cascade="all, delete-orphan",
+        backref=backref("parent", remote_side=[id]),
+        single_parent=True # <--- This tells SQLAlchemy each subfolder has ONLY ONE parent
     )
 
 class File(Base):
