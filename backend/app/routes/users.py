@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from typing import Optional
 from .. import models, auth, database
 
-router = APIRouter(tags=["Authentication"])
+router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 # --- 1. SIGNUP ROUTE ---
 @router.post("/signup")
