@@ -10,7 +10,7 @@ app = FastAPI(title="Distributed File Storage API")
 origins = [
     "http://localhost:5173",  # Your React local dev server
     "http://127.0.0.1:5173",
-    "https://distributed-file-storage-3g5k.onrender.com", # Your production URL
+    "https://distributed-file-storage-1-amo7.onrender.com", # Your production URL
 ]
 
 # 2. Add the Middleware
